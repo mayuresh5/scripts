@@ -2,145 +2,120 @@
 
 #!/bin/bash
 
-# Exit on error, treat unset variables as an error, and ensure pipeline failures are caught
-set -euo pipefail
-
-# --- Configuration ---
-# Default location to check, in addition to 'global'.
-# You can change this to your primary operational region.
-DEFAULT_LOCATION="asia-south1"
-TARGET_LOCATION="${1:-$DEFAULT_LOCATION}" # Use first argument as location, or default
-
-# Array of cost-related recommender IDs
-# Based on GCP documentation for cost optimization and Active Assist.
-# Note: You mentioned 'google.container.Diagnosis.Recommender'.
-# Documentation often lists it as 'google.container.DiagnosisRecommender'.
-# The script uses the latter, but you can adjust if your specific variant works.
+# Define a list of common cost-related recommender IDs
+# You can find more recommender IDs at:
+# https://cloud.google.com/recommender/docs/recommenders
 COST_RECOMMENDERS=(
-    "google.compute.instance.IdleResourceRecommender"           # Idle VMs
-    "google.compute.disk.IdleResourceRecommender"               # Idle persistent disks
-    "google.compute.address.IdleResourceRecommender"            # Idle IP addresses
-    "google.compute.image.IdleResourceRecommender"              # Idle custom images
-    "google.compute.commitment.UsageCommitmentRecommender"      # Resource-based CUDs
-    "google.cloudbilling.commitment.SpendBasedCommitmentRecommender" # Spend-based CUDs
-    "google.cloudsql.instance.IdleRecommender"                  # Cloud SQL idle instances
-    "google.cloudsql.instance.OverprovisionedRecommender"       # Cloud SQL overprovisioned instances
-    "google.run.service.CostRecommender"                        # Cloud Run CPU allocation
-    "google.container.DiagnosisRecommender"                     # Idle GKE clusters (adjust if your variant google.container.Diagnosis.Recommender is preferred)
-    "google.bigquery.capacityCommitments.Recommender"           # BigQuery slot commitments
-    "google.resourcemanager.projectUtilization.Recommender"     # Unused/unattended projects
-    "google.compute.instanceGroupManager.MachineTypeRecommender" # MIG machine types
-    "google.compute.instance.MachineTypeRecommender"            # VM machine types
+    "google.compute.instance.IdleResourceRecommender"
+    "google.compute.disk.IdleResourceRecommender"
+    "google.compute.address.IdleResourceRecommender"
+    "google.compute.image.IdleResourceRecommender"
+    "google.compute.instance.MachineTypeRecommender" # Rightsizing recommendations
+    "google.compute.instanceGroupManager.MachineTypeRecommender"
+    "google.cloudsql.instance.IdleRecommender"
+    "google.cloudsql.instance.OverprovisionedRecommender"
+    "google.resourcemanager.projectUtilization.Recommender" # Unattended projects
+    "google.billing.commitment.SpendBasedCommitmentRecommender" # CUDs for spend-based
+    "google.compute.commitment.UsageCommitmentRecommender" # CUDs for resource-based
+    "google.cloudrun.service.CostRecommender"
+    # Add or remove recommenders as needed
 )
 
-# Locations to check for each recommender
-# Some recommenders are global, others regional. We'll try both.
-LOCATIONS_TO_CHECK=("global" "$TARGET_LOCATION")
-# Remove duplicate if TARGET_LOCATION is 'global'
-if [[ "$TARGET_LOCATION" == "global" ]]; then
-    LOCATIONS_TO_CHECK=("global")
-fi
+# Optional: Define specific locations to check if global/default doesn't work for some recommenders.
+# Most cost recommenders are global or don't require explicit location at the project level for listing.
+# If a recommender consistently fails without a location, you might add relevant locations here.
+# Example: LOCATIONS_TO_CHECK=("global" "us-central1" "europe-west1" "asia-south1")
+# For many cost recommenders, not specifying --location works best as it covers global and relevant regional ones.
+LOCATIONS_TO_CHECK=("--location=global") # Default to global, gcloud handles many cases without explicit location.
+                                          # You can expand this array if needed, e.g. ("--location=global" "--location=us-central1")
 
-echo "Fetching cost recommendations for location: $TARGET_LOCATION and global"
-echo "---"
+echo "Fetching Active Assist Cost Recommendations..."
+echo "============================================="
 
-# Get all project IDs
-PROJECT_IDS=$(gcloud projects list --format="value(projectId)" --filter="lifecycleState:ACTIVE")
+# Get a list of all project IDs
+PROJECT_IDS=$(gcloud projects list --format="value(projectId)")
 
 if [ -z "$PROJECT_IDS" ]; then
-    echo "No active projects found or insufficient permissions to list projects."
+    echo "No projects found or you may not have permissions to list projects."
     exit 1
 fi
 
-for PROJECT_ID in $PROJECT_IDS; do
+# Loop through each project
+while IFS= read -r PROJECT_ID; do
     echo ""
-    echo "======================================================================"
-    echo "Processing Project: $PROJECT_ID"
-    echo "======================================================================"
+    echo "---------------------------------------------"
+    echo "Project: $PROJECT_ID"
+    echo "---------------------------------------------"
 
-    # --- Recommender API Check ---
-    # As per your note, recommender.googleapis.com might appear disabled
-    # but individual gcloud recommender commands might still work.
-    # If this check causes issues for projects where you expect recommendations,
-    # you can comment out this block (from here to "End of API Check").
-    #
-    # echo "Checking if Recommender API (recommender.googleapis.com) is enabled for project $PROJECT_ID..."
-    # API_ENABLED=$(gcloud services list --project="$PROJECT_ID" --enabled --filter="config.name:recommender.googleapis.com" --format="value(config.name)")
-    #
-    # if [ -z "$API_ENABLED" ]; then
-    #     echo "Recommender API (recommender.googleapis.com) is NOT ENABLED for project $PROJECT_ID. Skipping."
-    #     # Add a 'continue' here if you strictly want to skip based on this check.
-    #     # continue
-    #     echo "Warning: Recommender API appears disabled, but proceeding based on user feedback that individual recommenders might still work."
-    # else
-    #     echo "Recommender API (recommender.googleapis.com) is ENABLED for project $PROJECT_ID."
-    # fi
-    # --- End of API Check ---
-    # The script will proceed to try recommenders regardless of the above check by default,
-    # to align with your observation. Errors from 'gcloud recommender recommendations list'
-    # will indicate if a specific recommender is truly unavailable.
+    # Ensure the Recommender API is enabled for the project (optional check, gcloud will error out if not)
+    # Consider enabling it manually if the script fails here for multiple projects:
+    # gcloud services enable recommender.googleapis.com --project="$PROJECT_ID"
 
-    HAS_ANY_RECOMMENDATION_FOR_PROJECT=false
+    HAS_RECOMMENDATIONS_FOR_PROJECT=false
 
+    # Loop through each cost recommender
     for RECOMMENDER_ID in "${COST_RECOMMENDERS[@]}"; do
-        echo "--------------------------------------------------"
-        echo "Checking Recommender: $RECOMMENDER_ID for project $PROJECT_ID"
-        echo "--------------------------------------------------"
-        HAS_RECOMMENDATION_FOR_TYPE=false
+        echo "  Checking Recommender: $RECOMMENDER_ID"
 
-        for LOCATION in "${LOCATIONS_TO_CHECK[@]}"; do
-            echo "  Trying Location: $LOCATION"
+        # Attempt to list recommendations (often global, or gcloud handles location context)
+        # Forcing a specific location might be needed if the default doesn't work.
+        # However, many cost recommenders operate globally or across relevant regions by default.
 
-            # Construct the gcloud command
-            # We use || true to prevent the script from exiting if a specific recommender/location combo fails
-            # Errors will be printed to stderr by gcloud itself.
-            COMMAND="gcloud recommender recommendations list \
-                        --project=\"$PROJECT_ID\" \
-                        --location=\"$LOCATION\" \
-                        --recommender=\"$RECOMMENDER_ID\" \
-                        --filter=\"stateInfo.state=ACTIVE\" \
-                        --format=\"json\""
+        # First, try without an explicit location (or with --location=global)
+        # The --location flag for `gcloud recommender recommendations list` can be tricky
+        # as not all recommenders support all locations or the 'global' keyword in the same way.
+        # Often, omitting it for project-level queries lets gcloud pick the correct scope.
+        # If you need to check specific locations, uncomment and adapt the loop below.
 
-            # For unattended project recommender, a more specific subtype filter is common
-            if [[ "$RECOMMENDER_ID" == "google.resourcemanager.projectUtilization.Recommender" ]]; then
-                 COMMAND="gcloud recommender recommendations list \
-                            --project=\"$PROJECT_ID\" \
-                            --location=\"$LOCATION\" \
-                            --recommender=\"$RECOMMENDER_ID\" \
-                            --filter=\"stateInfo.state=ACTIVE AND recommenderSubtype=CLEANUP_PROJECT\" \
-                            --format=\"json\""
-            fi
+        COMMAND="gcloud recommender recommendations list --project=\"${PROJECT_ID}\" --recommender=\"${RECOMMENDER_ID}\" --format=\"yaml(description,lastRefreshTime,primaryImpact.costProjection.cost.units,primaryImpact.costProjection.cost.nanos,primaryImpact.costProjection.duration,name,stateInfo.state,content.operationGroups[0].operations[0].resource)\""
 
-            # Execute the command and capture output
-            # We check for specific errors that mean "not found" or "not applicable" vs. other errors.
-            if RECOMMENDATIONS_JSON=$(eval "$COMMAND" 2> >(tee /dev/stderr >&2)); then
-                if [ -n "$RECOMMENDATIONS_JSON" ] && [ "$RECOMMENDATIONS_JSON" != "[]" ]; then
-                    echo "  SUCCESS: Found recommendations for $RECOMMENDER_ID in $LOCATION for project $PROJECT_ID:"
-                    echo "$RECOMMENDATIONS_JSON"
-                    HAS_RECOMMENDATION_FOR_TYPE=true
-                    HAS_ANY_RECOMMENDATION_FOR_PROJECT=true
-                else
-                    echo "  INFO: No 'ACTIVE' recommendations found for $RECOMMENDER_ID in $LOCATION for project $PROJECT_ID."
-                fi
+        # Some recommenders might be location-specific.
+        # If a recommender typically requires a location and the above doesn't work,
+        # you can iterate through a list of common locations.
+        # For most cost recommenders, a single call (global or no location specified) is sufficient.
+
+        # Example for checking specific locations:
+        # for LOCATION_FLAG in "${LOCATIONS_TO_CHECK[@]}"; do
+        #   echo "    Attempting with ${LOCATION_FLAG}..."
+        #   RECOMMENDATIONS=$(gcloud recommender recommendations list \
+        #       --project="${PROJECT_ID}" \
+        #       --recommender="${RECOMMENDER_ID}" \
+        #       ${LOCATION_FLAG} \
+        #       --filter="stateInfo.state=ACTIVE" \
+        #       --format="yaml(description,lastRefreshTime,primaryImpact.costProjection.cost,name,stateInfo.state)" 2>/dev/null)
+        #   # ... (rest of the logic)
+        # done
+
+        RECOMMENDATIONS=$(eval "$COMMAND 2>/dev/null") # Suppress errors if recommender not found or no recommendations
+
+        if [ -n "$RECOMMENDATIONS" ]; then
+            ACTIVE_RECOMMENDATIONS=$(echo "$RECOMMENDATIONS" | grep "state: ACTIVE" -B5 -A5) # Basic filter for active ones, adjust as needed
+            if [ -n "$ACTIVE_RECOMMENDATIONS" ]; then
+                echo "    Active Recommendations Found:"
+                echo "$RECOMMENDATIONS" # Print the full YAML for active recommendations
+                echo "    -----------------------------------"
+                HAS_RECOMMENDATIONS_FOR_PROJECT=true
             else
-                # gcloud usually exits with non-zero on errors like API disabled, location not supported, or no recommendations at all.
-                # The error message from gcloud (redirected to stderr) would have been printed.
-                echo "  INFO: Failed to list recommendations or none found for $RECOMMENDER_ID in $LOCATION (Project: $PROJECT_ID). This recommender/location might not be applicable or API might be disabled for it."
+                echo "    No active recommendations found for $RECOMMENDER_ID."
             fi
-        done # End of location loop
-
-        if ! $HAS_RECOMMENDATION_FOR_TYPE; then
-            echo "No active recommendations found for $RECOMMENDER_ID across checked locations for project $PROJECT_ID."
+        else
+            # This can also mean the recommender is not applicable or enabled for the project/location combination.
+             # Check if the API is enabled, though gcloud usually gives a specific error for that.
+            API_ENABLED_CHECK=$(gcloud services list --project="$PROJECT_ID" --enabled --filter="config.name:recommender.googleapis.com" --format="value(config.name)")
+            if [[ -z "$API_ENABLED_CHECK" ]]; then
+                 echo "    Note: recommender.googleapis.com API might be disabled for project $PROJECT_ID."
+            else
+                 echo "    No recommendations found or recommender not applicable for $RECOMMENDER_ID."
+            fi
         fi
-    done # End of recommender loop
+    done
 
-    if ! $HAS_ANY_RECOMMENDATION_FOR_PROJECT; then
-        echo ""
-        echo "No cost-related recommendations found for project $PROJECT_ID with the configured recommenders and locations."
+    if ! $HAS_RECOMMENDATIONS_FOR_PROJECT; then
+        echo "  No cost recommendations found for project $PROJECT_ID with the checked recommenders."
     fi
-done # End of project loop
+
+done <<< "$PROJECT_IDS"
 
 echo ""
-echo "======================================================================"
-echo "Script finished."
-echo "======================================================================"
+echo "============================================="
+echo "Finished fetching recommendations."
