@@ -2,76 +2,56 @@
 
 #!/bin/bash
 
-# Script to fetch "Delete idle cluster" recommendations from GCP projects
-# Only fetches Cost category recommendations
+Output file
+OUTPUT_FILE="idle_cluster_recommendations.json"
+echo "[]" > "$OUTPUT_FILE"
 
-# Set output file
-OUTPUT_FILE="idle_cluster_recommendations.csv"
+Get all project IDs (excluding deleted ones)
+PROJECT_IDS=$(gcloud projects list --format="value(projectId)")
 
-# Create CSV header
-echo "Project ID,Recommendation ID,Description,Last Refresh Time,Primary Impact,State" > "$OUTPUT_FILE"
+echo "Scanning projects for 'Delete idle cluster' recommendations..."
 
-# Get list of all projects
-projects=$(gcloud projects list --format="value(projectId)")
+for PROJECT_ID in $PROJECT_IDS; do
+echo "Checking project: $PROJECT_ID"
 
-# Counter for logging
-total_projects=$(echo "$projects" | wc -l)
-current=0
+bash
+Copy
+Edit
+# Check if recommendation API is enabled
+API_STATUS=$(gcloud services list \
+    --project="$PROJECT_ID" \
+    --filter="recommendationengine.googleapis.com" \
+    --format="value(config.name)")
 
-# Function to check if recommender API is enabled
-check_api_enabled() {
-    local project_id=$1
-    gcloud services list --project="$project_id" | grep -q recommender.googleapis.com
-    return $?
-}
+if [[ -z "$API_STATUS" ]]; then
+    echo " - Recommendation API not enabled. Skipping."
+    continue
+fi
 
-# Function to enable recommender API
-enable_api() {
-    local project_id=$1
-    echo "Recommender API not enabled in project $project_id. Skipping..."
-    # Uncomment the line below if you want to enable the API automatically
-    # gcloud services enable recommender.googleapis.com --project="$project_id"
-}
+# Get recommendations
+RECOMMENDATIONS=$(gcloud recommender recommendations list \
+    --project="$PROJECT_ID" \
+    --location=global \
+    --recommender=google.cloud.gkeHub.clusterIdleRecommender \
+    --format=json 2>/dev/null)
 
-# Loop through each project
-for project_id in $projects; do
-    current=$((current+1))
-    echo "Processing project $current/$total_projects: $project_id"
-    
-    # Check if recommender API is enabled
-    if ! check_api_enabled "$project_id"; then
-        enable_api "$project_id"
-        continue
-    fi
-    
-    # Get cost recommender ID for idle clusters
-    # Note: The exact recommender ID might vary - this is for Dataproc idle clusters
-    recommender_id="google.dataproc.cluster.ClusterResourceIdle"
-    
-    # Try to fetch recommendations
-    recommendations=$(gcloud recommender recommendations list \
-        --project="$project_id" \
-        --location=global \
-        --recommender="$recommender_id" \
-        --format="json" 2>/dev/null)
-    
-    # Check if we got any recommendations
-    if [ -z "$recommendations" ] || [ "$recommendations" == "[]" ]; then
-        echo "No idle cluster recommendations found for project $project_id"
-        continue
-    fi
-    
-    # Process recommendations
-    echo "$recommendations" | jq -r '.[] | select(.recommenderSubtype=="DELETE_RESOURCE") | [
-        "'"$project_id"'",
-        .name,
-        .description,
-        .lastRefreshTime,
-        .primaryImpact.category,
-        .stateInfo.state
-    ] | @csv' >> "$OUTPUT_FILE"
-    
-    echo "Found recommendations for project $project_id"
+if [[ $? -ne 0 || "$RECOMMENDATIONS" == "[]" ]]; then
+    echo " - No idle cluster recommendations found. Skipping."
+    continue
+fi
+
+# Filter only category COST & recommendation DELETE_IDLE_CLUSTER
+MATCHING=$(echo "$RECOMMENDATIONS" | jq '[.[] | select(.recommenderSubtype == "DELETE_IDLE_CLUSTER" and .category == "COST")]')
+
+if [[ "$MATCHING" == "[]" ]]; then
+    echo " - No matching recommendations. Skipping."
+    continue
+fi
+
+echo " - Found recommendations. Adding to output."
+
+# Append to output file
+jq -s '.[0] + .[1]' "$OUTPUT_FILE" <(echo "$MATCHING") > tmp.json && mv tmp.json "$OUTPUT_FILE"
 done
 
-echo "Script completed. Results saved to $OUTPUT_FILE"
+echo "✅ Done. Results stored in: $OUTPUT_FILE"
