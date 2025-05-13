@@ -2,56 +2,66 @@
 
 #!/bin/bash
 
-File to store the output
-OUTPUT_FILE="idle_cluster_recommendations.json"
-echo "[]" > "$OUTPUT_FILE"
+# Get the current date for any logging or output filenames if needed
+# CURRENT_DATE=$(date +"%Y-%m-%d_%H-%M-%S")
 
-Get all active project IDs
-PROJECT_IDS=$(gcloud projects list --format="value(projectId)")
+echo "Starting script to fetch Active Assist Cost recommendations..."
+echo "----------------------------------------------------------"
 
-echo "Scanning GCP projects for 'Delete idle cluster' recommendations under 'COST' category..."
+# Get all project IDs
+PROJECT_IDS=$(gcloud projects list --format="value(projectId)" --quiet)
 
+if [ -z "$PROJECT_IDS" ]; then
+  echo "No projects found or gcloud CLI is not configured correctly."
+  exit 1
+fi
+
+# Loop through each project ID
 for PROJECT_ID in $PROJECT_IDS; do
-echo "Checking project: $PROJECT_ID"
+  echo ""
+  echo "Processing project: $PROJECT_ID"
 
-bash
-Copy
-Edit
-# Check if the Recommender API is enabled
-API_ENABLED=$(gcloud services list \
+  # Check if the Recommender API is enabled for the project
+  API_ENABLED=$(gcloud services list --project="$PROJECT_ID" --filter="config.name=recommender.googleapis.com" --format="value(config.name)" --quiet)
+
+  if [ "$API_ENABLED" != "recommender.googleapis.com" ]; then
+    echo "  Skipping project $PROJECT_ID: Recommender API (recommender.googleapis.com) is not enabled."
+    continue
+  fi
+
+  echo "  Recommender API is enabled for $PROJECT_ID."
+
+  # Fetch cost recommendations.
+  # We use 'google.cost.recommender' which is a common ID for general cost recommendations.
+  # Recommendations are typically global, but some specific cost recommenders might be regional.
+  # We filter for ACTIVE recommendations.
+  echo "  Fetching 'Category: Cost' recommendations for $PROJECT_ID..."
+  RECOMMENDATIONS_JSON=$(gcloud recommender recommendations list \
     --project="$PROJECT_ID" \
-    --filter="config.name:recommender.googleapis.com" \
-    --format="value(config.name)")
+    --recommender="google.cost.recommender" \
+    --location="global" \
+    --filter="stateInfo.state=ACTIVE" \
+    --format="json" --quiet)
 
-if [[ -z "$API_ENABLED" ]]; then
-    echo " - Recommender API is not enabled. Skipping."
+  # Check if the command was successful and if recommendations were found
+  if [ $? -ne 0 ]; then
+    echo "  Skipping project $PROJECT_ID: Error occurred while fetching recommendations. This might be due to permissions or the recommender not being applicable."
     continue
-fi
+  fi
 
-# Fetch recommendations (Delete Idle Cluster - Category COST)
-RECOMMENDATIONS=$(gcloud recommender recommendations list \
-    --project="$PROJECT_ID" \
-    --location=global \
-    --recommender=google.cloud.gkeHub.clusterIdleRecommender \
-    --format=json 2>/dev/null)
+  # Check if the JSON array is empty (no recommendations)
+  if [ -z "$RECOMMENDATIONS_JSON" ] || [ "$RECOMMENDATIONS_JSON" == "[]" ]; then
+    echo "  Skipping project $PROJECT_ID: No active 'Category: Cost' recommendations found (using google.cost.recommender in global location)."
+  else
+    echo "  Active 'Category: Cost' recommendations for project $PROJECT_ID:"
+    echo "$RECOMMENDATIONS_JSON"
+    # If you want to save output to individual files per project:
+    # echo "$RECOMMENDATIONS_JSON" > "${PROJECT_ID}_cost_recommendations_${CURRENT_DATE}.json"
+    # echo "  Recommendations saved to ${PROJECT_ID}_cost_recommendations_${CURRENT_DATE}.json"
+  fi
 
-if [[ $? -ne 0 || "$RECOMMENDATIONS" == "[]" ]]; then
-    echo " - No recommendations found or error occurred. Skipping."
-    continue
-fi
-
-# Filter for recommendations with subtype DELETE_IDLE_CLUSTER and category COST
-MATCHING=$(echo "$RECOMMENDATIONS" | jq '[.[] | select(.recommenderSubtype == "DELETE_IDLE_CLUSTER" and .category == "COST")]')
-
-if [[ "$MATCHING" == "[]" ]]; then
-    echo " - No matching recommendations in COST category. Skipping."
-    continue
-fi
-
-echo " - Found matching recommendations. Appending to output."
-
-# Append results to output JSON file
-jq -s '.[0] + .[1]' "$OUTPUT_FILE" <(echo "$MATCHING") > tmp.json && mv tmp.json "$OUTPUT_FILE"
 done
 
-echo "✅ Done. Final results saved to $OUTPUT_FILE"
+echo ""
+echo "----------------------------------------------------------"
+echo "Script finished."
